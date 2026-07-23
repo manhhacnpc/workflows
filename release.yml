@@ -1,0 +1,11 @@
+name: Build RTL8812EU for Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-rtl8812eu.yml
+    with:
+      openwrt_version: '23.05'
