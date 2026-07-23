@@ -1,0 +1,318 @@
+name: Build RTL8812EU Driver for OpenWRT
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      openwrt_version:
+        description: 'OpenWRT version (22.03, 23.05, snapshot)'
+        required: true
+        default: '23.05'
+        type: choice
+        options:
+          - '22.03'
+          - '23.05'
+          - 'snapshot'
+
+permissions:
+  contents: write
+
+jobs:
+  build-driver:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        target: [ramips/mt7621]
+        include:
+          - target: ramips/mt7621
+            sdk_arch: ramips-mt7621
+            target_name: Xiaomi Mi Router 3G
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            build-essential \
+            clang \
+            flex \
+            bison \
+            gawk \
+            gettext \
+            git \
+            libncurses5-dev \
+            libssl-dev \
+            rsync \
+            unzip \
+            zlib1g-dev \
+            zstd \
+            xz-utils \
+            python3 \
+            python3-setuptools \
+            file \
+            wget \
+            curl \
+            time
+
+      - name: Determine OpenWRT SDK version
+        id: sdk_version
+        run: |
+          if [ "${{ github.event.inputs.openwrt_version }}" == "snapshot" ]; then
+            echo "version=snapshots" >> $GITHUB_OUTPUT
+            echo "sdk_url=https://downloads.openwrt.org/snapshots/targets/${{ matrix.target }}/" >> $GITHUB_OUTPUT
+          else
+            echo "version=${{ github.event.inputs.openwrt_version || '23.05' }}" >> $GITHUB_OUTPUT
+            echo "sdk_url=https://downloads.openwrt.org/releases/${{ github.event.inputs.openwrt_version || '23.05' }}/targets/${{ matrix.target }}/" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download & Extract OpenWRT SDK
+        id: extract_sdk
+        run: |
+          SDK_URL="${{ steps.sdk_version.outputs.sdk_url }}"
+          echo "Downloading SDK from: $SDK_URL"
+          
+          # Lấy tên file SDK từ trang
+          SDK_HTML=$(curl -sL "$SDK_URL" | grep -oE 'openwrt-sdk-[^"]+\.tar\.xz' | head -n 1)
+          
+          if [ -z "$SDK_HTML" ]; then
+            # Fallback: thử download file cụ thể
+            if [ "${{ steps.sdk_version.outputs.version }}" == "snapshots" ]; then
+              SDK_FILENAME=$(curl -sL "$SDK_URL" | grep -oE 'openwrt-sdk-[0-9.]+-[^"]+\.tar\.xz' | head -n 1)
+            else
+              SDK_FILENAME="openwrt-sdk-${{ steps.sdk_version.outputs.version }}-${{ matrix.sdk_arch }}_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
+            fi
+          else
+            SDK_FILENAME="$SDK_HTML"
+          fi
+          
+          echo "SDK Filename: $SDK_FILENAME"
+          echo "sdk_filename=$SDK_FILENAME" >> $GITHUB_OUTPUT
+          
+          wget -O sdk.tar.xz "$SDK_URL$SDK_FILENAME"
+          
+          if [ $? -ne 0 ]; then
+            echo "Failed to download SDK. Trying alternative URL..."
+            # Thử với phiên bản cụ thể
+            if [ "${{ steps.sdk_version.outputs.version }}" == "23.05" ]; then
+              wget -O sdk.tar.xz "https://downloads.openwrt.org/releases/23.05.5/targets/${{ matrix.target }}/openwrt-sdk-23.05.5-${{ matrix.sdk_arch }}_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
+            elif [ "${{ steps.sdk_version.outputs.version }}" == "22.03" ]; then
+              wget -O sdk.tar.xz "https://downloads.openwrt.org/releases/22.03.7/targets/${{ matrix.target }}/openwrt-sdk-22.03.7-${{ matrix.sdk_arch }}_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
+            fi
+          fi
+          
+          tar -xf sdk.tar.xz
+          rm -f sdk.tar.xz
+          
+          # Tìm thư mục SDK và đổi tên
+          SDK_DIR=$(find . -maxdepth 1 -type d -name "openwrt-sdk-*" | head -n 1)
+          if [ -z "$SDK_DIR" ]; then
+            echo "Cannot find SDK directory!"
+            exit 1
+          fi
+          mv $SDK_DIR openwrt-sdk
+          echo "sdk_dir=$(pwd)/openwrt-sdk" >> $GITHUB_OUTPUT
+
+      - name: Build RTL8812EU Driver from svpcom source
+        run: |
+          cd openwrt-sdk
+          
+          echo "=== Creating package structure ==="
+          mkdir -p package/rtl8812eu
+          
+          echo "=== Cloning svpcom/rtl8812eu source ==="
+          git clone --depth 1 -b master https://github.com/svpcom/rtl8812eu.git package/rtl8812eu/src
+          
+          echo "=== Creating OpenWRT package Makefile ==="
+          cat << 'EOF' > package/rtl8812eu/Makefile
+          # OpenWRT package Makefile for RTL8812EU driver from svpcom
+          
+          include $(TOPDIR)/rules.mk
+          include $(INCLUDE_DIR)/kernel.mk
+          include $(INCLUDE_DIR)/package.mk
+          
+          PKG_NAME:=rtl8812eu
+          PKG_VERSION:=svpcom
+          PKG_RELEASE:=1
+          PKG_SOURCE:=
+          PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/$(PKG_NAME)
+          
+          define KernelPackage/rtl8812eu
+            SUBMENU:=Wireless Drivers
+            TITLE:=Realtek RTL8812EU Wireless Driver (svpcom)
+            FILES:=$(PKG_BUILD_DIR)/8812eu.ko
+            AUTOLOAD:=$(call AutoProbe,8812eu)
+            DEPENDS:=+kmod-cfg80211 +kmod-usb-core
+            PROVIDES:=kmod-rtl8812eu
+          endef
+          
+          define KernelPackage/rtl8812eu/description
+            Kernel module driver for Realtek RTL8812EU USB Wi-Fi adapters.
+            Source: svpcom/rtl8812eu on GitHub
+            Optimized for FPV (First Person View) applications.
+          endef
+          
+          define Build/Prepare
+            mkdir -p $(PKG_BUILD_DIR)
+            cp -r $(TOPDIR)/package/rtl8812eu/src/* $(PKG_BUILD_DIR)/
+          endef
+          
+          define Build/Compile
+            $(MAKE) -C "$(LINUX_DIR)" \
+              ARCH="$(LINUX_KARCH)" \
+              CROSS_COMPILE="$(TARGET_CROSS)" \
+              M="$(PKG_BUILD_DIR)" \
+              KCFLAGS="-w" \
+              EXTRA_CFLAGS="-w -DCONFIG_LITTLE_ENDIAN" \
+              USER_EXTRA_CFLAGS="-w -DCONFIG_LITTLE_ENDIAN" \
+              modules
+          endef
+          
+          $(eval $(call KernelPackage,rtl8812eu))
+          EOF
+          
+          echo "=== Creating src/Makefile for kernel module ==="
+          cat << 'EOF' > package/rtl8812eu/src/Makefile
+          # Makefile for rtl8812eu kernel module (svpcom)
+          
+          # Use obj-m for kernel module
+          obj-m := 8812eu.o
+          
+          # Include source files
+          8812eu-y := \
+            hal/HalHWImg8812E_MAC.o \
+            hal/HalHWImg8812E_BB.o \
+            hal/HalHWImg8812E_RF.o \
+            hal/HalPhyRf_8812E.o \
+            hal/HalPwrSeqCmd.o \
+            hal/rtl8812e_hal_init.o \
+            hal/rtl8812e_phycfg.o \
+            hal/rtl8812e_rf6052.o \
+            hal/rtl8812e_dm.o \
+            hal/rtl8812e_rxdesc.o \
+            hal/rtl8812e_cmd.o \
+            hal/rtl8812e_xmit.o \
+            hal/rtl8812e_recv.o \
+            hal/rtl8812e_led.o \
+            core/rtw_ap.o \
+            core/rtw_br_ext.o \
+            core/rtw_cmd.o \
+            core/rtw_debug.o \
+            core/rtw_efuse.o \
+            core/rtw_io.o \
+            core/rtw_ioctl_query.o \
+            core/rtw_ioctl_set.o \
+            core/rtw_ieee80211.o \
+            core/rtw_mlme.o \
+            core/rtw_mlme_ext.o \
+            core/rtw_mp.o \
+            core/rtw_mp_ioctl.o \
+            core/rtw_p2p.o \
+            core/rtw_pwrctrl.o \
+            core/rtw_recv.o \
+            core/rtw_rf.o \
+            core/rtw_security.o \
+            core/rtw_sta_mgt.o \
+            core/rtw_wlan_util.o \
+            core/rtw_xmit.o \
+            core/rtw_odm.o \
+            core/rtw_bt.o \
+            core/rtw_ioctl.o \
+            core/rtw_sreset.o \
+            core/rtw_wifi.o \
+            core/rtw_wow.o \
+            core/rtw_beamforming.o \
+            os_dep/linux/rtw_android.o \
+            os_dep/linux/rtw_cfgvendor.o \
+            os_dep/linux/ioctl_cfg80211.o \
+            os_dep/linux/rtw_ioctl.o \
+            os_dep/linux/mlme_linux.o \
+            os_dep/linux/recv_linux.o \
+            os_dep/linux/xmit_linux.o \
+            os_dep/linux/os_intfs.o \
+            os_dep/linux/usb_intf.o \
+            os_dep/linux/usb_ops_linux.o
+          EOF
+          
+          echo "=== Configuring OpenWRT SDK ==="
+          rm -rf tmp
+          
+          # Add package to configuration
+          echo "CONFIG_PACKAGE_kmod-rtl8812eu=m" >> .config
+          echo "CONFIG_DRIVER_11AC_SUPPORT=y" >> .config
+          
+          # Configure for target
+          make defconfig
+          
+          echo "=== Building RTL8812EU package ==="
+          make package/rtl8812eu/compile V=s -j$(nproc)
+          
+          # Collect built packages
+          mkdir -p ../release_assets
+          
+          echo "=== Looking for built packages ==="
+          find bin/ -type f -name "*.ipk" -exec ls -la {} \;
+          find bin/ -type f -name "*rtl8812eu*.ipk" -exec cp {} ../release_assets/ \;
+          
+          if [ -z "$(ls -A ../release_assets/)" ]; then
+            echo "WARNING: No rtl8812eu package found. Copying all .ipk files..."
+            find bin/ -type f -name "*.ipk" -exec cp {} ../release_assets/ \;
+          fi
+          
+          echo "=== Built Assets ==="
+          ls -la ../release_assets/
+
+      - name: Create package information
+        run: |
+          cd release_assets
+          echo "# RTL8812EU Driver Build Information" > README.md
+          echo "" >> README.md
+          echo "## Build Details" >> README.md
+          echo "- OpenWRT Version: ${{ github.event.inputs.openwrt_version || '23.05' }}" >> README.md
+          echo "- Target: ${{ matrix.target }}" >> README.md
+          echo "- Source: svpcom/rtl8812eu" >> README.md
+          echo "- Build Date: $(date -u)" >> README.md
+          echo "- Commit: ${{ github.sha }}" >> README.md
+          echo "" >> README.md
+          echo "## Files" >> README.md
+          ls -la >> README.md
+          echo "" >> README.md
+          echo "## Installation" >> README.md
+          echo "1. Copy the .ipk file to your OpenWRT router" >> README.md
+          echo "2. Install with: \`opkg install kmod-rtl8812eu_*.ipk\`" >> README.md
+          echo "3. Reboot or run: \`modprobe 8812eu\`" >> README.md
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rtl8812eu-driver-${{ matrix.target }}
+          path: release_assets/
+          retention-days: 30
+
+      - name: Upload to Release
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release_assets/*
+          tag_name: nightly-build
+          name: Nightly Build - RTL8812EU Driver
+          body: |
+            ## RTL8812EU Driver Nightly Build
+            
+            This is an automated build from the latest source.
+            
+            **OpenWRT Version:** ${{ github.event.inputs.openwrt_version || '23.05' }}
+            
+            **Build Date:** $(date -u)
+            
+            **Source:** svpcom/rtl8812eu
+          draft: false
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
